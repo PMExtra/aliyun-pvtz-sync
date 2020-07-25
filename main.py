@@ -18,7 +18,9 @@ from aliyunsdkpvtz.request.v20180101.DeleteZoneRecordRequest import DeleteZoneRe
 logging.basicConfig(level=logging.INFO, format='')
 load_dotenv()
 
-DOMAIN = os.getenv('PVTZ_SYNC_PVTZ_DOMAIN')
+INTERVAL = int(os.getenv('PVTZ_SYNC_INTERVAL', 60))
+PVTZ_DOMAIN = os.getenv('PVTZ_SYNC_PVTZ_DOMAIN')
+PVTZ_RESOURCE_GROUP_ID = os.getenv('PVTZ_SYNC_PVTZ_RESOURCE_GROUP_ID')
 ECS_REGION_ID = os.getenv('PVTZ_SYNC_ECS_REGION_ID')
 ECS_ZONE_ID = os.getenv('PVTZ_SYNC_ECS_ZONE_ID')
 ECS_VPC_ID = os.getenv('PVTZ_SYNC_ECS_VPC_ID')
@@ -33,7 +35,6 @@ class Synchronizer:
   def __init__(self):
     ACCESS_KEY = os.getenv('PVTZ_SYNC_ACCESS_KEY')
     SECRET_KEY = os.getenv('PVTZ_SYNC_SECRET_KEY')
-    self.__interval = int(os.getenv('PVTZ_SYNC_INTERVAL', 60))
     self.__client = client.AcsClient(ACCESS_KEY, SECRET_KEY, ECS_REGION_ID)
     self.__cancel = threading.Event()
     self.zone_id = self.get_zone_id()
@@ -85,9 +86,8 @@ class Synchronizer:
   def _zone_filter_request(self):
     request = DescribeZonesRequest()
     request.set_PageSize(1)
-    request.set_Keyword(DOMAIN)
-    RESOURCE_GROUP_ID = os.getenv('PVTZ_SYNC_PVTZ_RESOURCE_GROUP_ID')
-    if RESOURCE_GROUP_ID: request.set_ResourceGroupId(RESOURCE_GROUP_ID)
+    request.set_Keyword(PVTZ_DOMAIN)
+    if PVTZ_RESOURCE_GROUP_ID: request.set_ResourceGroupId(PVTZ_RESOURCE_GROUP_ID)
     return request
 
   def get_zone_id(self):
@@ -139,7 +139,7 @@ class Synchronizer:
 
   def _add(self, name, ip):
     self._added += 1
-    logging.info(f'Add record: {name}.{DOMAIN} -> {ip}.')
+    logging.info(f'Add record: {name}.{PVTZ_DOMAIN} -> {ip}.')
     request = AddZoneRecordRequest()
     request.set_ZoneId(self.zone_id)
     request.set_Rr(name)
@@ -158,7 +158,7 @@ class Synchronizer:
 
   def _remove(self, record_id, name = None, ip = None):
     self._removed += 1
-    logging.info(f'Remove record ({record_id}): {name}.{DOMAIN} -> {ip}.')
+    logging.info(f'Remove record ({record_id}): {name}.{PVTZ_DOMAIN} -> {ip}.')
     request = DeleteZoneRecordRequest()
     request.set_RecordId(record_id)
     response = self._send_request(request)
@@ -226,7 +226,7 @@ class Synchronizer:
     self.__cancel.clear()
     while not self.__cancel.is_set():
       self.sync()
-      self.__cancel.wait(self.__interval)
+      self.__cancel.wait(INTERVAL)
 
   def stop(self):
     self.__cancel.set()
