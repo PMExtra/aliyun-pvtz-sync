@@ -1,0 +1,4 @@
+aliyun-python-sdk-core==2.13.24
+aliyun-python-sdk-ecs==4.19.9
+aliyun-python-sdk-pvtz==1.0.4
+python-dotenv==0.14.0
