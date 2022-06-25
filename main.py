@@ -3,11 +3,10 @@ import json
 import logging
 import signal
 import threading
-from time import sleep
 from itertools import groupby
 from operator import itemgetter
 from dotenv import load_dotenv
-from aliyunsdkcore import client
+from aliyunsdkcore.client import AcsClient
 from aliyunsdkecs.request.v20140526.DescribeInstancesRequest import DescribeInstancesRequest
 from aliyunsdkpvtz.request.v20180101.DescribeZonesRequest import DescribeZonesRequest
 from aliyunsdkpvtz.request.v20180101.DescribeZoneRecordsRequest import DescribeZoneRecordsRequest
@@ -19,9 +18,12 @@ logging.basicConfig(level=logging.INFO, format='')
 load_dotenv()
 
 INTERVAL = int(os.getenv('PVTZ_SYNC_INTERVAL', 60))
+REQUEST_NETWORK = os.getenv('PVTZ_SYNC_REQUEST_NETWORK') or 'public'
+REGION_ID = os.getenv('PVTZ_SYNC_REGION_ID')
 PVTZ_DOMAIN = os.getenv('PVTZ_SYNC_PVTZ_DOMAIN')
+PVTZ_REGION_ID = os.getenv('PVTZ_SYNC_PVTZ_REGION_ID') or REGION_ID
 PVTZ_RESOURCE_GROUP_ID = os.getenv('PVTZ_SYNC_PVTZ_RESOURCE_GROUP_ID')
-ECS_REGION_ID = os.getenv('PVTZ_SYNC_ECS_REGION_ID')
+ECS_REGION_ID = os.getenv('PVTZ_SYNC_ECS_REGION_ID') or REGION_ID
 ECS_ZONE_ID = os.getenv('PVTZ_SYNC_ECS_ZONE_ID')
 ECS_VPC_ID = os.getenv('PVTZ_SYNC_ECS_VPC_ID')
 ECS_VSWITCH_ID = os.getenv('PVTZ_SYNC_ECS_VSWITCH_ID')
@@ -29,25 +31,25 @@ ECS_SECURITY_GROUP_ID = os.getenv('PVTZ_SYNC_ECS_SECURITY_GROUP_ID')
 ECS_RESOURCE_GROUP_ID = os.getenv('PVTZ_SYNC_ECS_RESOURCE_GROUP_ID')
 ECS_INSTANCE_IDS = os.getenv('PVTZ_SYNC_ECS_INSTANCE_IDS')
 ECS_EXCLUDE_INSTANCE_IDS = os.getenv('PVTZ_SYNC_ECS_EXCLUDE_INSTANCE_IDS')
-REMARK = 'aliyun-pvtz-sync.generated'
+REMARK = os.getenv('PVTZ_SYNC_REMARK') or 'aliyun_pvtz_sync.generated'
+
 
 class Synchronizer:
   def __init__(self):
     ACCESS_KEY = os.getenv('PVTZ_SYNC_ACCESS_KEY')
     SECRET_KEY = os.getenv('PVTZ_SYNC_SECRET_KEY')
-    self.__client = client.AcsClient(ACCESS_KEY, SECRET_KEY, ECS_REGION_ID)
+    self.__client = AcsClient(ACCESS_KEY, SECRET_KEY, ECS_REGION_ID)
     self.__cancel = threading.Event()
     self.zone_id = self.get_zone_id()
 
   def _send_request(self, request):
-    request.set_accept_format('json')
-    try:
-      response_str = self.__client.do_action(request)
-      logging.debug(response_str)
-      response_detail = json.loads(response_str)
-      return response_detail
-    except Exception as e:
-      logging.error(e)
+    request.request_network = REQUEST_NETWORK
+    if request.get_product() == 'pvtz' and request.request_network == 'vpc':
+      request.endpoint = 'pvtz.vpc-proxy.aliyuncs.com'
+    response_str = self.__client.do_action_with_exception(request)
+    logging.debug(response_str)
+    response_detail = json.loads(response_str)
+    return response_detail
 
   def _ecs_filter_request(self):
     request = DescribeInstancesRequest()
@@ -65,18 +67,14 @@ class Synchronizer:
     request = self._ecs_filter_request()
     while True:
       response = self._send_request(request)
-      if response is None:
-        logging.warn('Get instances failed, unexpected response: None.')
-        break
+      instances += response['Instances']['Instance']
+      if response['TotalCount'] > response['PageNumber'] * response['PageSize']:
+        request.set_PageNumber(request.get_PageNumber() + 1)
       else:
-        instances += response['Instances']['Instance']
-        if response['TotalCount'] > response['PageNumber'] * response['PageSize']:
-          request.set_PageNumber(request.get_PageNumber() + 1)
-        else:
-          break
+        break
     if ECS_EXCLUDE_INSTANCE_IDS:
       EXCLUDE_INSTANCE_ID_ARRAY = ECS_EXCLUDE_INSTANCE_IDS.split()
-      filtered = list(filter(lambda i : i['InstanceId'] not in EXCLUDE_INSTANCE_ID_ARRAY, instances))
+      filtered = list(filter(lambda i: i['InstanceId'] not in EXCLUDE_INSTANCE_ID_ARRAY, instances))
       logging.debug(f'Get {len(filtered)} instances (excluded {len(instances) - len(filtered)}).')
       return filtered
     else:
@@ -85,7 +83,8 @@ class Synchronizer:
 
   def _zone_filter_request(self):
     request = DescribeZonesRequest()
-    request.set_PageSize(1)
+    request.set_SearchMode("EXACT")
+    request.set_QueryRegionId(PVTZ_REGION_ID)
     request.set_Keyword(PVTZ_DOMAIN)
     if PVTZ_RESOURCE_GROUP_ID: request.set_ResourceGroupId(PVTZ_RESOURCE_GROUP_ID)
     return request
@@ -94,8 +93,10 @@ class Synchronizer:
     request = self._zone_filter_request()
     response = self._send_request(request)
     count = response["TotalItems"]
-    if count != 1:
-      logging.error(f'Cannot determine zone id. (${count})')
+    if count == 0:
+      raise Exception("Cannot find the zone.")
+    elif count > 1:
+      raise Exception(f'Cannot determine zone id between ${count} zones.')
     return response['Zones']['Zone'][0]['ZoneId']
 
   def _records_filter_request(self):
@@ -109,16 +110,12 @@ class Synchronizer:
     request = self._records_filter_request()
     while True:
       response = self._send_request(request)
-      if response is None:
-        logging.warn('Get records failed, unexpected response: None.')
-        break
+      records += response['Records']['Record']
+      if response['TotalPages'] > response['PageNumber']:
+        request.set_PageNumber(request.get_PageNumber() + 1)
       else:
-        records += response['Records']['Record']
-        if response['TotalPages'] > response['PageNumber']:
-          request.set_PageNumber(request.get_PageNumber() + 1)
-        else:
-          break
-    filtered = list(filter(lambda r : r.get('Remark') == REMARK, records))
+        break
+    filtered = list(filter(lambda r: r.get('Remark') == REMARK, records))
     logging.debug(f'Get {len(filtered)} auto generated records (excluded {len(records) - len(filtered)} mannual records).')
     return filtered
 
@@ -134,7 +131,7 @@ class Synchronizer:
 
   def _current(self):
     records = self.list_records()
-    result = [(key, list(group)) for key, group in groupby(sorted(records, key = itemgetter('Rr', 'Value')), itemgetter('Rr'))]
+    result = [(key, list(group)) for key, group in groupby(sorted(records, key=itemgetter('Rr', 'Value')), itemgetter('Rr'))]
     return result
 
   def _add(self, name, ip):
@@ -146,9 +143,7 @@ class Synchronizer:
     request.set_Type('A')
     request.set_Value(ip)
     response = self._send_request(request)
-    if response is None:
-      logging.warn('Add record failed, unexpected response: None.')
-    elif response.get('Success') is not True:
+    if response.get('Success') is not True:
       logging.warn(f'Add record failed, RequestId: {response.get("RequestId")}.')
     else:
       request = UpdateRecordRemarkRequest()
@@ -156,15 +151,13 @@ class Synchronizer:
       request.set_Remark(REMARK)
       response = self._send_request(request)
 
-  def _remove(self, record_id, name = None, ip = None):
+  def _remove(self, record_id, name=None, ip=None):
     self._removed += 1
     logging.info(f'Remove record ({record_id}): {name}.{PVTZ_DOMAIN} -> {ip}.')
     request = DeleteZoneRecordRequest()
     request.set_RecordId(record_id)
     response = self._send_request(request)
-    if response is None:
-      logging.warn('Remove record failed, unexpected response: None.')
-    elif response.get('RecordId') != record_id:
+    if response.get('RecordId') != record_id:
       logging.warn(f'Remove record failed, RequestId: {response.get("RequestId")}.')
 
   def _syncIp(self, name, expected, current):
@@ -200,18 +193,22 @@ class Synchronizer:
     cur = next(icur, None)
     while exp is not None or cur is not None:
       if exp is None:
-        for record in cur[1]: self._remove(record['RecordId'], record['Rr'], record['Value'])
+        for record in cur[1]:
+          self._remove(record['RecordId'], record['Rr'], record['Value'])
         cur = next(icur, None)
       elif cur is None:
         name = exp[0]
-        for ip in exp[1]: self._add(name, ip)
+        for ip in exp[1]:
+          self._add(name, ip)
         exp = next(iexp, None)
       elif exp[0] > cur[0]:
-        for record in cur[1]: self._remove(record['RecordId'], record['Rr'], record['Value'])
+        for record in cur[1]:
+          self._remove(record['RecordId'], record['Rr'], record['Value'])
         cur = next(icur, None)
       elif exp[0] < cur[0]:
         name = exp[0]
-        for ip in exp[1]: self._add(name, ip)
+        for ip in exp[1]:
+          self._add(name, ip)
         exp = next(iexp, None)
       else:
         self._syncIp(exp[0], exp[1], cur[1])
@@ -231,6 +228,7 @@ class Synchronizer:
   def stop(self):
     self.__cancel.set()
 
+
 def main():
   synchronizer = Synchronizer()
 
@@ -242,6 +240,7 @@ def main():
     signal.signal(sig, shutdown_handler)
 
   synchronizer.start()
+
 
 if __name__ == '__main__':
   main()
